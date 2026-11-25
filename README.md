@@ -1,7 +1,9 @@
-# agent-harness: an agent-driven merge pipeline, as a reference extract
+# agent-harness: an agent-driven development pipeline, from a task file to a merged PR (reference extract)
 
-This is an extract from the harness one person uses to develop products with AI coding agents. It starts and supervises parallel
-Claude Code sessions, reviews their pull requests, feeds a GitHub merge queue and tells the owner only when a human is needed.
+This is an extract from the harness one person uses to develop products with AI coding agents. It covers the whole path: a task written as a
+brief file, a sandboxed Claude Code session that writes the code and opens a pull request, an independent review session, a fixer
+session when changes are requested, and a GitHub merge queue that lands it. It starts and supervises many such sessions in
+parallel and tells the owner only when a human is needed.
 It is built and used by one person, and it has run daily on one Mac for about two months.
 
 The products it builds are [Keyorix](https://github.com/keyorixhq/keyorix), an on-premise secrets manager, and DashDiag, a second

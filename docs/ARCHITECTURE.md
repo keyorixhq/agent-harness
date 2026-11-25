@@ -1,4 +1,4 @@
-# Architecture
+# Architecture: from task file to merged PR
 
 ```
  owner ──asks/answers──► kx-asks ◄──ask-owner── sessions (sandboxed Claude Code, one per task, own clone, own branch)
