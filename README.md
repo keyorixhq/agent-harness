@@ -6,7 +6,7 @@ session when changes are requested, and a GitHub merge queue that lands it. It s
 parallel and tells the owner only when a human is needed.
 It is built and used by one person, and it has run daily on one Mac for about two months.
 
-The products it builds are [Keyorix](https://github.com/keyorixhq/keyorix), an on-premise secrets manager, and DashDiag, a second
+The products it builds are [Keyorix](https://github.com/keyorixhq/keyorix), an on-premise secrets manager, and [DashDiag](https://github.com/keyorixhq/dashdiag), a second
 product that will use the same harness. The harness merges pull requests into the product repository (`keyorixhq/keyorix`), not into
 itself; names such as `kclone`, the Helm chart, the SDK repository and the Postgres test variables belong to the product.
 
