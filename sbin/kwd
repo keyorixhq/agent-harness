@@ -1,0 +1,181 @@
+#!/bin/zsh
+# kwd -- MERGE-MASTER's narrow exit for merge-queue bookkeeping (keyorixhq/keyorix only).
+# Runs outside the session sandbox with the owner's gh auth; sessions reach merge-queue state only through it.
+#   kwd approve N SHA      record a review approval pinned to head SHA (refused if SHA != current head)
+#   kwd unapprove N        remove N from approved.txt
+#   kwd hold N | unhold N  add/remove N on merge-tick's HOLD line
+#   kwd enqueue N          preflight (merge into today's main + checks), then enqueue on PASS
+#   kwd dequeue N          remove N from the merge queue
+#   kwd supersede OLD NEW [why]  OLD is replaced by NEW: unapprove, hold, dequeue, NEVER-APPROVE (auto-closed when NEW merges)
+#   kwd update-branch N    gh pr update-branch N (merge main into the PR branch on GitHub)
+#   kwd status             queue entries + approved/hold summary
+# Log: ~/proj/prompts/watchdog/kwd.log
+set -u
+P=$HOME/proj/prompts; R=keyorixhq/keyorix; LOG=$P/watchdog/kwd.log; MT=$P/bin/merge-tick.sh
+HL=$(grep -n '^HOLD=' $MT | head -1 | cut -d: -f1)   # 2026-10-15: HOLD line found by pattern
+unset GH_TOKEN GITHUB_TOKEN
+die() { echo "kwd: $*" >&2; exit 2; }
+num() { [[ ${1:-} =~ '^[0-9]+$' ]] || die "PR number expected, got '${1:-}'"; }
+. $HOME/proj/prompts/bin/lib-actor.sh
+. $HOME/proj/prompts/bin/lib-dispatch.sh   # 2026-10-29: decline_pending_review() (9-site sweep, single source of truth)
+log() { echo "$(date '+%F %H:%M') [by:$(kx_actor)] $*" >> $LOG; }
+cmd=${1:-}; shift 2>/dev/null
+case $cmd in
+  approve)
+    num ${1:-}; [[ ${2:-} =~ '^[0-9a-f]{40}$' ]] || die "full 40-char head SHA required"
+    # 2026-10-20: fixer sessions approved security-sensitive PRs that need owner/Opus review. List them in NEVER-APPROVE.txt; only the coordinator overrides.
+    if [[ -f $P/NEVER-APPROVE.txt ]] && grep -qE "^$1( |\$)" $P/NEVER-APPROVE.txt && [[ -z ${KWD_FORCE:-} ]]; then log "REFUSED approve #$1 (NEVER-APPROVE.txt)"; die "#$1 is in NEVER-APPROVE.txt (needs admin/Opus review); not approving"; fi
+    head=$(gh pr view $1 -R $R --json headRefOid -q .headRefOid) || die "cannot read #$1"
+    [[ $head == $2 ]] || die "#$1 head is $head, not $2: review the current head"
+    # 2026-10-25 PROVENANCE: no approval without a recorded source for this exact head (review APPROVE, owner, clean merge of main, ready list).
+    prov=$P/watchdog/approval-provenance.txt; touch $prov
+    # 2026-10-25: MERGE-MASTER / REVIEWER-2 approvals are recorded as their own review, EXCEPT risk-critical PRs,
+    # which need an independent REVIEW-N-DEEP APPROVE on this exact head (provenance written by review-pump / ready-feeder).
+    actor=$(kx_actor)
+    if [[ $actor == *MERGE-MASTER* || $actor == *REVIEWER-2* ]] && ! grep -q "^$1 $2 " $prov; then
+      if grep -qE "^$1 critical" $P/watchdog/risk-critical.txt 2>/dev/null; then
+        log "REFUSED approve #$1 ${2:0:8}: risk-critical needs an independent deep review (actor $actor)"; die "#$1 is risk-critical: needs a REVIEW-$1-DEEP APPROVE on this head (the review pump starts it); MERGE-MASTER cannot self-approve it"
+      fi
+      echo "$1 $2 MERGE-MASTER-REVIEW [by:$actor]" >> $prov
+    fi
+    if ! grep -q "^$1 $2 " $prov; then
+      if [[ -n ${KWD_WHY:-} ]]; then echo "$1 $2 COORD ${KWD_WHY} [by:$(kx_actor)]" >> $prov
+      else log "REFUSED approve #$1 ${2:0:8}: no provenance [caller: $(ps -o args= -p $PPID 2>/dev/null | cut -c1-90)]"; die "no provenance for #$1 at ${2:0:8}: an approval needs a review APPROVE, owner's OK, or a clean merge of main on record. Coordinator override: KWD_WHY=\"<reason>\" kwd approve ..."; fi
+    fi
+    grep -vE "^$1( |\$)" $P/approved.txt > $P/approved.txt.tmp; echo "$1 $2" >> $P/approved.txt.tmp
+    mv $P/approved.txt.tmp $P/approved.txt
+    # 2026-11-01: approved.txt (permission) and declined-heads.txt (a review's verdict on this exact head) are
+    # deliberately separate -- a PR nearly merged with two real defects because enqueue once checked only approved.txt. Keep that protection: only clear declined-heads.txt here when the decline
+    # text is the bot's own PROCEDURAL placeholder (".github change, waits on admin" / its ADR twin), which approve
+    # is exactly what resolves -- never for a real CHANGES/defect verdict, which still needs a new head or KWD_FORCE.
+    dh=$P/watchdog/declined-heads.txt
+    if [ -f $dh ] && grep -qE "^$1 $2 (\.github change|docs/adr change), waits on (owner|admin)" $dh; then
+      grep -vE "^$1 $2 (\.github change|docs/adr change), waits on (owner|admin)" $dh > $dh.tmp && mv $dh.tmp $dh
+      log "cleared declined-heads.txt placeholder for #$1 $2 (waits-on-owner, resolved by this approve)"
+    fi
+    log "approve #$1 $2 [caller: $(ps -o args= -p $PPID 2>/dev/null | cut -c1-90); grandparent: $(ps -o args= -p $(ps -o ppid= -p $PPID 2>/dev/null | tr -d ' ') 2>/dev/null | cut -c1-90)]"; echo "approved #$1 at ${2:0:8}" ;;
+  unapprove)
+    num ${1:-}; grep -vE "^$1( |\$)" $P/approved.txt > $P/approved.txt.tmp; mv $P/approved.txt.tmp $P/approved.txt
+    log "unapprove #$1"; echo "unapproved #$1" ;;
+  hold|unhold)
+    num ${1:-}; line=$(sed -n ${HL}p $MT); [[ $line == HOLD=* ]] || die "merge-tick line $HL is not the HOLD line"
+    # 2026-11-17 HOLD-REAPER-1 (owner, #N): a session must not hold an APPROVED PR just because the queue is paused; the pause already
+    # keeps it out, and the hold would outlive the pause. Narrow: reflex actors only, QUEUE-PAUSED present, approved at the current head.
+    if [[ $cmd == hold && -f $P/QUEUE-PAUSED && $(kx_actor) == *(MERGE-MASTER|REVIEWER-2)* && -z ${KWD_FORCE:-} ]]; then
+      _h=$(gh pr view $1 -R $R --json headRefOid -q .headRefOid 2>/dev/null)
+      if [[ -n $_h ]] && grep -qE "^$1 $_h( |\$)" $P/approved.txt 2>/dev/null; then
+        log "REFUSED hold #$1: queue paused and PR approved at ${_h:0:8} (pause already blocks enqueue; use KWD_FORCE=1 if there is a real defect, and unapprove it first)"
+        die "#$1 is approved at the current head and the queue is paused: the pause already keeps it out of the queue. A hold is not needed (a real defect: kwd unapprove $1 first)"
+      fi
+    fi
+    if [[ $cmd == hold ]]; then [[ $line == *" $1 "* ]] || sed -i '' "${HL}s/HOLD=\" /HOLD=\" $1 /" $MT
+    else sed -i '' "${HL}s/ $1 / /" $MT; fi
+    log "$cmd #$1"; sed -n ${HL}p $MT
+    # hold also removes the PR from the merge queue (2026-10-10: #N was held while already queued)
+    if [[ $cmd == hold ]]; then "$0" dequeue $1 2>&1 | grep -v 'Could not resolve' | sed 's/^/  /' || true; fi ;;
+  enqueue)
+    # 2026-11-04: match only the quoted HOLD="..." value, not the whole line -- the trailing
+    # comment on that line can (and did, for #N) contain a bare " N " as part of its own
+    # changelog prose, which a whole-line substring match reads as a hold. Strip the comment
+    # (everything from the first unquoted '#') before matching.
+    num ${1:-}; holdval=$(sed -n ${HL}p $MT | sed -E 's/^HOLD="([^"]*)".*/\1/')
+    [[ $holdval == *" $1 "* ]] && die "#$1 is on HOLD"
+    # ENQ-DEDUP-1 (2026-11-21): the feeder, a tick or a hand call could start a second `kwd enqueue` for the same PR while the first was still in its
+    # preflight (two full preflights for #N and #N at 16:24, and an UNPROCESSABLE enqueue of #N which was already queued). One enqueue per PR at a time,
+    # and none for a PR that is already in the queue. Stale lock after 50 min. Off: touch ENQ-DEDUP-OFF (in the prompts dir).
+    if [ ! -f $P/ENQ-DEDUP-OFF ]; then
+      _el=/tmp/kx-kwd-enq-$1.lock
+      [ -d $_el ] && [ $(( $(date +%s) - $(stat -f %m $_el 2>/dev/null || echo 0) )) -gt 3000 ] && rmdir $_el 2>/dev/null
+      mkdir $_el 2>/dev/null || { log "enqueue #$1: another kwd enqueue for this PR is running; skipped (ENQ-DEDUP-1)"; echo "enqueue #$1: already in progress"; exit 0; }
+      trap 'rmdir $_el 2>/dev/null' EXIT
+      if gh api graphql -f query='{repository(owner:"keyorixhq",name:"keyorix"){mergeQueue(branch:"main"){entries(first:50){nodes{pullRequest{number}}}}}}' -q '.data.repository.mergeQueue.entries.nodes[].pullRequest.number' 2>/dev/null | grep -qx "$1"; then log "enqueue #$1: already in the merge queue; skipped (ENQ-DEDUP-1)"; echo "enqueue #$1: already queued"; exit 0; fi
+    fi
+    if [[ -z ${KWD_FORCE:-} ]] && ! enq_guard $1; then log "REFUSED enqueue #$1: fixer in flight ($DISPATCH_HELD_BY)"; die "#$1: a fixer session ($DISPATCH_HELD_BY) is working this PR; a queued branch cannot be pushed to (GH006). Wait for it to finish, or KWD_FORCE=1"; fi   # 2026-11-16
+    # 2026-11-04: QUEUE-PAUSED (main-red.sh, "only [fix-main] PRs may enqueue while main is red") was only
+    # enforced in merge-tick.sh's own refill loop -- ready-feeder.sh, queue-empty-kick.sh and a live MERGE-MASTER
+    # pass calling `kwd enqueue` directly all bypassed it, which is how PRs kept re-entering a paused queue
+    # (dequeued twice, back within minutes each time, via a path other than merge-tick's loop). Enforce it here
+    # as well, at the place the manual and session enqueue paths go through, rather than teaching N callers about the file.
+    if [ -f $P/QUEUE-PAUSED ] && [[ -z ${KWD_FORCE:-} ]]; then
+      t=$(gh pr view $1 -R $R --json title -q .title 2>/dev/null)
+      if [[ "$t" != *"[fix-main]"* ]]; then
+        log "REFUSED enqueue #$1: QUEUE-PAUSED (main red) and title has no [fix-main]"
+        die "#$1: QUEUE-PAUSED is set (main is red) and this PR is not titled [fix-main]; only the fix-main PR may enqueue until main is green, or KWD_FORCE=1 to override"
+      fi
+    fi
+    # 2026-11-24 ENQ-GATE-1 (#N: enqueued twice by two different automatic paths while its DEEP review was still running and without owner's OK for a scripts/ci change):
+    # the one place every enqueue path goes through refuses (a) a gated PR (.github, scripts/ci, ...) with no row for this head in github-approved.txt (ci_gate_blocks) and
+    # (b) a PR whose DEEP review session is still alive. KWD_FORCE=1 bypasses (owner by hand). Off: touch watchdog/ENQ-GATE-OFF.
+    if [ ! -f $P/watchdog/ENQ-GATE-OFF ] && [[ -z ${KWD_FORCE:-} ]]; then
+      _eh=$(gh pr view $1 -R $R --json headRefOid -q .headRefOid 2>/dev/null); _ef=$(gh pr view $1 -R $R --json files -q '[.files[].path]|join(",")' 2>/dev/null)
+      if [ -n "$_eh" ] && ci_gate_blocks $1 $_eh "$_ef"; then
+        log "REFUSED enqueue #$1: $CI_GATE_WHY, no OK in github-approved.txt for ${_eh:0:9} (ENQ-GATE-1)"; echo "$(date -u +%FT%TZ) kwd: REFUSED enqueue #$1 ${_eh:0:9}: $CI_GATE_WHY" >> $P/watchdog/enq-gate.log
+        die "#$1: $CI_GATE_WHY; needs owner's OK for this head first (bin/kx-gh-approve $1), or KWD_FORCE=1"
+      fi
+      if pgrep -f "SESSION-REVIEW-$1-DEEP-[0-9]+\\.md" >/dev/null 2>&1; then
+        log "REFUSED enqueue #$1: a DEEP review session is still running (ENQ-GATE-1)"; echo "$(date -u +%FT%TZ) kwd: REFUSED enqueue #$1 ${_eh:0:9}: DEEP review still running" >> $P/watchdog/enq-gate.log
+        die "#$1: its DEEP review is still running; enqueue after the verdict, or KWD_FORCE=1"
+      fi
+    fi
+    # 2026-11-19 CHURN-2: a PR dequeued ENQ_CHURN_MAX (4) times within ENQ_CHURN_H (6) hours is a repeat offender; each add/remove rebuilds the groups behind it.
+    # Off by default: watchdog/ENQ-CHURN-ON enables the refusal (bin/mq-churn-report.sh shows the numbers); KWD_FORCE=1 bypasses.
+    if [ -f $P/watchdog/ENQ-CHURN-ON ] && [[ -z ${KWD_FORCE:-} ]]; then
+      _hs=$(gh pr view $1 -R $R --json headRefOid -q .headRefOid 2>/dev/null); _hf=""
+      [ -n "$_hs" ] && { _hi=$(gh api repos/$R/commits/$_hs -q .commit.committer.date 2>/dev/null); [ -n "$_hi" ] && _hf=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$_hi" +%s 2>/dev/null | xargs -I{} date -r {} '+%F %H:%M'); }
+      cc=$(zsh $P/bin/mq-churn-report.sh --count $1 ${ENQ_CHURN_H:-6} "$_hf")
+      if [ "${cc:-0}" -ge "${ENQ_CHURN_MAX:-4}" ] 2>/dev/null; then log "REFUSED enqueue #$1: churn guard ($cc dequeues in ${ENQ_CHURN_H:-6}h)"; die "#$1 was dequeued $cc times in the last ${ENQ_CHURN_H:-6} h; not enqueued again until it changes (KWD_FORCE=1 to override)"; fi
+    fi
+    # 2026-11-19 PREFLIGHT-2: cheap deterministic guard tests on the merge of the PR into current main (bin/mq-preflight.sh, ~30 s, no model).
+    # watchdog/ENQ-PREFLIGHT-LOG = run and log the verdict only; watchdog/ENQ-PREFLIGHT-ON = refuse the enqueue when it FAILS or conflicts. KWD_FORCE=1 bypasses.
+    if [ -f $P/watchdog/ENQ-PREFLIGHT-ON -o -f $P/watchdog/ENQ-PREFLIGHT-LOG ] && [[ -z ${KWD_FORCE:-} ]]; then
+      pf=$(zsh $P/bin/mq-preflight.sh $1 2>&1 | tail -1); log "preflight #$1: $pf"
+      if [ -f $P/watchdog/ENQ-PREFLIGHT-ON ] && [[ "$pf" == *" FAIL "* || "$pf" == *" CONFLICT "* ]]; then
+        die "#$1: preflight on the merge with main failed, not enqueued: $pf (fix it, or KWD_FORCE=1 to override)"
+      fi
+    fi
+    # 2026-10-28: approve recorded provenance for a head whose CODE was never independently re-reviewed (only a
+    # metadata-file edit was checked by hand), and this command had no idea a review had since declined that exact
+    # head -- it only ever checked approved.txt/provenance, never declined-heads.txt. A head that a review had
+    # declined for two real defects was enqueued by this command an hour later anyway. Refuse here too, unconditionally
+    # (independent reviews and kwd approve are both run by fallible actors; neither should be able to enqueue around the
+    # other's "no" on the SAME exact head). KWD_FORCE bypasses it, same escape hatch as the provenance check below, but
+    # still logs loudly so a forced enqueue over a real decline is never silent.
+    hd=$(gh pr view $1 -R $R --json headRefOid -q .headRefOid) || die "cannot read #$1"
+    dl=$(grep "^$1 $hd " $P/watchdog/declined-heads.txt 2>/dev/null | tail -1)
+    # 2026-10-29: MERGE-MASTER's own placeholder ("waits on independent REVIEW-DEEP") means a review is owed, not a
+    # decline -- review-pump's harvest adds an APPROVE to READY-LIST.txt but never retracts this line, so without this
+    # exclusion `kwd enqueue` would hard-refuse a PR a review has already cleared (6th site of the same gap). Moved to
+    # decline_pending_review() (lib-dispatch.sh) -- single source of truth after the full 9-site sweep.
+    decline_pending_review "$dl" && dl=""
+    if [[ -n $dl && -z ${KWD_FORCE:-} ]]; then log "REFUSED enqueue #$1 ${hd:0:8}: declined-heads says '$dl'"; die "#$1 at ${hd:0:8} is in declined-heads.txt ('$dl'): a review has not cleared this exact head. Fix it, re-approve at the new head, or KWD_FORCE=1 kwd enqueue ... if you are certain the decline is stale"; fi
+    [[ -n $dl ]] && log "FORCED enqueue #$1 ${hd:0:8} despite declined-heads: '$dl'"
+    apin=$(grep -E "^$1 [0-9a-f]{40}" $P/approved.txt | tail -1 | cut -d' ' -f2)
+    if [[ -n $apin && -z ${KWD_FORCE:-} ]] && ! grep -q "^$1 $apin " $P/watchdog/approval-provenance.txt 2>/dev/null; then log "REFUSED enqueue #$1: approval at ${apin:0:8} has no provenance"; die "#$1: approval at ${apin:0:8} has no provenance; get a review APPROVE on that head first"; fi
+    # 2026-11-06: preflight under a hard timeout (a hung kwd enqueue used to hold a whole MERGE-MASTER pass up to its 50 min alarm).
+    # A timeout leaves no verdict, so nothing is cached as FAIL; KWD_PF_TIMEOUT overrides (seconds).
+    pf=$(perl -e 'alarm shift; exec @ARGV' ${KWD_PF_TIMEOUT:-2700} zsh $P/bin/preflight.sh $1 2>&1 | tail -1)
+    [[ $pf == PASS* ]] || { [[ $pf == FAIL* || $pf == MISS* ]] || log "preflight #$1: no verdict (timeout ${KWD_PF_TIMEOUT:-2700}s or crash): ${pf:-empty}"; die "preflight: ${pf:-no verdict (timeout or crash)} (log /tmp/preflight-$1.log)"; }
+    id=$(gh pr view $1 -R $R --json id -q .id)
+    out=$(gh api graphql -f query="mutation{enqueuePullRequest(input:{pullRequestId:\"$id\"}){mergeQueueEntry{position}}}" -q .data.enqueuePullRequest.mergeQueueEntry.position 2>&1 | tail -1)
+    log "enqueue #$1 -> $out"; echo "enqueue #$1 -> $out" ;;
+  supersede)
+    # 2026-11-07 (#N/#N): a replaced PR must stop being approvable the moment its replacement exists.
+    num ${1:-}; num ${2:-}; old=$1; new=$2; why=${3:-replacement PR}
+    [[ $old != $new ]] || die "a PR cannot supersede itself"
+    [[ $(gh pr view $new -R $R --json state -q .state 2>/dev/null) == OPEN ]] || die "#$new is not an open PR"
+    grep -qE "^$old SUPERSEDED" $P/NEVER-APPROVE.txt 2>/dev/null || echo "$old SUPERSEDED by #$new ($why). Never approve/enqueue; closed automatically after #$new merges. [by:$(kx_actor) $(date -u +%F)]" >> $P/NEVER-APPROVE.txt
+    grep -vE "^$old( |\$)" $P/approved.txt > $P/approved.txt.tmp; mv $P/approved.txt.tmp $P/approved.txt
+    zsh $0 hold $old >/dev/null 2>&1; zsh $0 dequeue $old >/dev/null 2>&1
+    log "supersede #$old by #$new ($why)"; echo "#$old is superseded by #$new: unapproved, held, never-approve" ;;
+  dequeue)
+    num ${1:-}; id=$(gh pr view $1 -R $R --json id -q .id)
+    out=$(gh api graphql -f query="mutation{dequeuePullRequest(input:{id:\"$id\"}){mergeQueueEntry{state}}}" 2>&1 | tail -1)
+    log "dequeue #$1 -> $out [caller: $(ps -o args= -p $PPID 2>/dev/null | cut -c1-90); grandparent: $(ps -o args= -p $(ps -o ppid= -p $PPID 2>/dev/null | tr -d ' ') 2>/dev/null | cut -c1-90)]"; echo "dequeue #$1 -> $out" ;;   # 2026-11-06: #N was dequeued at 18:37Z and nothing recorded who did it
+  update-branch)
+    num ${1:-}; out=$(gh pr update-branch $1 -R $R 2>&1 | tail -1); log "update-branch #$1 -> $out"; echo "$out" ;;
+  status)
+    gh api graphql -f query='{repository(owner:"keyorixhq",name:"keyorix"){mergeQueue{entries(first:30){nodes{position state pullRequest{number}}}}}}' \
+      -q '.data.repository.mergeQueue.entries.nodes[]|"queue \(.position) #\(.pullRequest.number) \(.state)"'
+    echo "approved: $(grep -c . $P/approved.txt) entries; $(sed -n ${HL}p $MT | cut -d'#' -f1)" ;;
+  *) die "usage: kwd approve N SHA | unapprove N | hold N | unhold N | enqueue N | dequeue N | update-branch N | status" ;;
+esac
