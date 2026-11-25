@@ -45,8 +45,8 @@ sandbox, keeps their work reviewable, and spends the owner's attention only wher
 
 ## Known limitations
 - Reference extract, not a product: macOS and zsh only, a fixed home directory, no installer, no support.
-- Planned, not done: the harness is to be ported to Linux, and the control plane rewritten in Python as part of that port. Until then it is
-  zsh and bash scripts that assume macOS tools (`stat -f`, `date -r`, `pgrep -fl`); the code here will change shape.
+- In progress, not in this extract: the harness is being ported to Linux, and the control plane rewritten in Python as part of that port. What you
+  see here is the zsh and bash version with macOS tools (`stat -f`, `date -r`, `pgrep -fl`); the code will change shape.
 - The OS sandbox is default-deny for writes and secrets, but the sandbox profiles are not published, and some helper profiles
   (preflight, pre-push) run with `allow default` plus a read deny-list and no network deny. It is a guardrail for cooperative
   agents, not a security boundary against a hostile one.
